@@ -221,6 +221,36 @@ ensure_packages() {
   return 0
 }
 
+install_haproxy() {
+  if command -v haproxy >/dev/null 2>&1; then
+    add_log "HAProxy is already installed."
+    render
+    pause_enter
+    return 0
+  fi
+  add_log "Installing HAProxy..."
+  render
+  apt-get update -y >/dev/null 2>&1
+  apt-get install -y haproxy >/dev/null 2>&1 && add_log "HAProxy installed successfully." || add_log "HAProxy installation failed."
+  render
+  pause_enter
+}
+
+uninstall_haproxy() {
+  if ! command -v haproxy >/dev/null 2>&1; then
+    add_log "HAProxy is not installed."
+    render
+    pause_enter
+    return 0
+  fi
+  add_log "Uninstalling HAProxy..."
+  render
+  apt-get purge -y haproxy >/dev/null 2>&1 && add_log "HAProxy uninstalled successfully." || add_log "HAProxy uninstallation failed."
+  apt-get autoremove -y >/dev/null 2>&1
+  render
+  pause_enter
+}
+
 systemd_reload() { systemctl daemon-reload >/dev/null 2>&1; }
 
 unit_exists() { [[ -f "/etc/systemd/system/$1" ]]; }
@@ -301,8 +331,79 @@ EOF
 
   [[ $? -eq 0 ]] && add_log "Forwarder created: fw-gre${id}-${port}" || add_log "Failed writing forwarder: $unit"
 }
+
+update_haproxy_config() {
+  local cfg_dir="/etc/haproxy/gre-forwards"
+  local main_cfg="/etc/haproxy/haproxy-gre.cfg"
+  mkdir -p "$cfg_dir"
+
+  add_log "Regenerating HAProxy config..."
+
+  cat >"$main_cfg" <<EOF
+global
+    maxconn 10000
+
+defaults
+    mode tcp
+    timeout connect 5s
+    timeout client 50s
+    timeout server 50s
+EOF
+
+  local f
+  for f in "$cfg_dir"/*.cfg; do
+    [[ -e "$f" ]] && cat "$f" >> "$main_cfg"
+  done
+
+  if ! unit_exists "haproxy-gre.service"; then
+    cat >"/etc/systemd/system/haproxy-gre.service" <<EOF
+[Unit]
+Description=HAProxy Shared Forwarder for GRE
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/sbin/haproxy -f ${main_cfg}
+ExecReload=/usr/sbin/haproxy -f ${main_cfg} -c -q
+ExecReload=/bin/kill -USR2 \$MAINPID
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemd_reload
+    enable_now "haproxy-gre.service"
+  else
+    systemctl reload "haproxy-gre.service" >/dev/null 2>&1 || systemctl restart "haproxy-gre.service" >/dev/null 2>&1
+  fi
+}
+
+make_haproxy_fw_service() {
+  local id="$1" port="$2" target_ip="$3"
+  local snippet_path="/etc/haproxy/gre-forwards/fw-ha-gre${id}-${port}.cfg"
+
+  if [[ -f "$snippet_path" ]]; then
+    add_log "HAProxy Forwarder already in config: GRE${id}:${port}"
+    return 0
+  fi
+
+  add_log "Adding HAProxy snippet: GRE${id}:${port}"
+  cat >"$snippet_path" <<EOF
+
+frontend ft_gre${id}_${port}
+    bind *:${port}
+    default_backend bk_gre${id}_${port}
+
+backend bk_gre${id}_${port}
+    server srv1 ${target_ip}:${port} maxconn 10000
+EOF
+
+  update_haproxy_config
+}
+
 iran_setup() {
-  local ID IRANIP KHAREJIP GREBASE
+  local ID IRANIP KHAREJIP GREBASE METHOD
   local -a PORT_LIST=()
 
   ask_until_valid "GRE Number :" is_int ID
@@ -310,6 +411,24 @@ iran_setup() {
   ask_until_valid "KHAREJ IP :" valid_ipv4 KHAREJIP
   ask_until_valid "GRE IP RANG (Example : 10.80.70.0):" valid_gre_base GREBASE
   ask_ports
+
+  while true; do
+    render
+    echo "Forwarding Method:"
+    echo "1) Socat (Standard)"
+    echo "2) HAProxy (High Performance)"
+    echo
+    read -r -e -p "Select method [1-2]: " METHOD
+    METHOD="$(trim "$METHOD")"
+    if [[ "$METHOD" == "2" ]]; then
+       if ! command -v haproxy >/dev/null 2>&1; then
+         add_log "HAProxy is not installed! Please install it from the main menu first."
+         continue
+       fi
+    fi
+    [[ "$METHOD" == "1" || "$METHOD" == "2" ]] && break
+    add_log "Invalid selection: $METHOD"
+  done
 
   local key=$((ID*100))
   local local_gre_ip peer_gre_ip
@@ -327,7 +446,11 @@ iran_setup() {
   add_log "Creating forwarders..."
   local p
   for p in "${PORT_LIST[@]}"; do
-    make_fw_service "$ID" "$p" "$peer_gre_ip"
+    if [[ "$METHOD" == "1" ]]; then
+      make_fw_service "$ID" "$p" "$peer_gre_ip"
+    else
+      make_haproxy_fw_service "$ID" "$p" "$peer_gre_ip"
+    fi
   done
 
   add_log "Reloading systemd..."
@@ -336,8 +459,14 @@ iran_setup() {
   add_log "Starting gre${ID} + forwarders..."
   enable_now "gre${ID}.service"
   for p in "${PORT_LIST[@]}"; do
-    enable_now "fw-gre${ID}-${p}.service"
+    if [[ "$METHOD" == "1" ]]; then
+      enable_now "fw-gre${ID}-${p}.service"
+    fi
   done
+
+  if [[ "$METHOD" == "2" ]]; then
+     enable_now "haproxy-gre.service"
+  fi
 
   render
   echo "GRE IPs:"
@@ -348,7 +477,11 @@ iran_setup() {
   show_unit_status_brief "gre${ID}.service"
   for p in "${PORT_LIST[@]}"; do
     echo
-    show_unit_status_brief "fw-gre${ID}-${p}.service"
+    if [[ "$METHOD" == "1" ]]; then
+      show_unit_status_brief "fw-gre${ID}-${p}.service"
+    else
+      echo "Forwarder GRE${ID}:${p} (HAProxy) is active in haproxy-gre.service"
+    fi
   done
   pause_enter
 }
@@ -405,16 +538,16 @@ get_gre_ids() {
 
 get_fw_units_for_id() {
   local id="$1"
-  find /etc/systemd/system -maxdepth 1 -type f -name "fw-gre${id}-*.service" 2>/dev/null \
+  find /etc/systemd/system -maxdepth 1 -type f \( -name "fw-gre${id}-*.service" -o -name "fw-ha-gre${id}-*.service" \) 2>/dev/null \
     | awk -F/ '{print $NF}' \
-    | grep -E "^fw-gre${id}-[0-9]+\.service$" \
+    | grep -E "^(fw-gre${id}|fw-ha-gre${id})-[0-9]+\.service$" \
     | sort -V || true
 }
 
 get_all_fw_units() {
-  find /etc/systemd/system -maxdepth 1 -type f -name "fw-gre*-*.service" 2>/dev/null \
+  find /etc/systemd/system -maxdepth 1 -type f \( -name "fw-gre*-*.service" -o -name "fw-ha-gre*-*.service" \) 2>/dev/null \
     | awk -F/ '{print $NF}' \
-    | grep -E '^fw-gre[0-9]+-[0-9]+\.service$' \
+    | grep -E '^(fw-gre|fw-ha-gre)[0-9]+-[0-9]+\.service$' \
     | sort -V || true
 }
 MENU_SELECTED=-1
@@ -516,22 +649,45 @@ service_action_menu() {
         confirm="$(trim "$confirm")"
         if [[ "$confirm" == "YES" ]]; then
            add_log "Removing $unit"
-           systemctl stop "$unit" >/dev/null 2>&1 || true
-           systemctl disable "$unit" >/dev/null 2>&1 || true
-
+           
            if [[ "$unit" =~ ^gre([0-9]+)\.service$ ]]; then
              local id="${BASH_REMATCH[1]}"
-             local -a fw_to_del
-             mapfile -t fw_to_del < <(get_fw_units_for_id "$id")
-             for fwd in "${fw_to_del[@]}"; do
-                add_log "Stopping/Disabling $fwd"
-                systemctl stop "$fwd" >/dev/null 2>&1 || true
-                systemctl disable "$fwd" >/dev/null 2>&1 || true
-                rm -f "/etc/systemd/system/$fwd"
+             systemctl stop "gre${id}.service" >/dev/null 2>&1 || true
+             systemctl disable "gre${id}.service" >/dev/null 2>&1 || true
+             rm -f "/etc/systemd/system/gre${id}.service"
+
+             # Remove all socat forwarders for this GRE
+             local -a fwd_units
+             mapfile -t fwd_units < <(find /etc/systemd/system -maxdepth 1 -type f -name "fw-gre${id}-*.service" 2>/dev/null | awk -F/ '{print $NF}')
+             for f in "${fwd_units[@]}"; do
+                add_log "Removing Socat forwarder: $f"
+                systemctl stop "$f" >/dev/null 2>&1 || true
+                systemctl disable "$f" >/dev/null 2>&1 || true
+                rm -f "/etc/systemd/system/$f"
              done
+
+             # Remove all haproxy forwarders for this GRE
+             local -a fwd_configs
+             mapfile -t fwd_configs < <(find /etc/haproxy/gre-forwards -maxdepth 1 -type f -name "fw-ha-gre${id}-*.cfg" 2>/dev/null)
+             if ((${#fwd_configs[@]} > 0)); then
+               for f in "${fwd_configs[@]}"; do
+                 add_log "Removing HAProxy snippet: $(basename "$f")"
+                 rm -f "$f"
+               done
+               update_haproxy_config
+             fi
+
+           elif [[ "$unit" =~ ^fw-gre([0-9]+)-([0-9]+)\.service$ ]]; then
+             systemctl stop "$unit" >/dev/null 2>&1 || true
+             systemctl disable "$unit" >/dev/null 2>&1 || true
+             rm -f "/etc/systemd/system/$unit"
+
+           elif [[ "$unit" =~ ^fw-ha-gre([0-9]+)-([0-9]+)\.cfg$ ]]; then
+             add_log "Removing HAProxy snippet: $unit"
+             rm -f "/etc/haproxy/gre-forwards/$unit"
+             update_haproxy_config
            fi
 
-           rm -f "/etc/systemd/system/$unit"
            systemctl daemon-reload >/dev/null 2>&1
            systemctl reset-failed >/dev/null 2>&1
            add_log "Successfully removed: $unit"
@@ -547,6 +703,72 @@ service_action_menu() {
   done
 }
 
+haproxy_management() {
+  if ! command -v haproxy >/dev/null 2>&1; then
+    add_log "HAProxy is not installed."
+    render
+    pause_enter
+    return 0
+  fi
+
+  local sel=""
+  while true; do
+    render
+    echo "HAProxy ManageMent"
+    echo
+    echo "1) HAProxy Service Control (haproxy-gre.service)"
+    echo "2) Manage Forwards (Snippets)"
+    echo "3) View Full Config (/etc/haproxy/haproxy-gre.cfg)"
+    echo "0) Back"
+    echo
+    read -r -e -p "Select: " sel
+    sel="$(trim "$sel")"
+
+    case "$sel" in
+      1) service_action_menu "haproxy-gre.service" ;;
+      2)
+        local -a ha_configs
+        local -a ha_labels
+        mapfile -t ha_configs < <(find /etc/haproxy/gre-forwards -maxdepth 1 -type f -name "fw-ha-gre*-*.cfg" 2>/dev/null | awk -F/ '{print $NF}' | sort -V)
+        
+        if ((${#ha_configs[@]} == 0)); then
+          add_log "No HAProxy forwards found."
+          render
+          pause_enter
+          continue
+        fi
+
+        for cfg in "${ha_configs[@]}"; do
+          if [[ "$cfg" =~ ^fw-ha-gre([0-9]+)-([0-9]+)\.cfg$ ]]; then
+            ha_labels+=("GRE${BASH_REMATCH[1]}:${BASH_REMATCH[2]}")
+          else
+            ha_labels+=("$cfg")
+          fi
+        done
+
+        if menu_select_index "HAProxy Forwards" "Select HAProxy forward to manage:" "${ha_labels[@]}"; then
+          local idx="$MENU_SELECTED"
+          local target="${ha_configs[$idx]}"
+          service_action_menu "$target"
+        fi
+        ;;
+      3)
+        render
+        echo "---- HAProxy GRE Config ----"
+        if [[ -f /etc/haproxy/haproxy-gre.cfg ]]; then
+          cat /etc/haproxy/haproxy-gre.cfg
+        else
+          echo "Config file not found."
+        fi
+        echo "----------------------------"
+        pause_enter
+        ;;
+      0) return 0 ;;
+      *) add_log "Invalid selection: $sel" ;;
+    esac
+  done
+}
+
 services_management() {
   local sel=""
 
@@ -554,8 +776,8 @@ services_management() {
     render
     echo "Services ManageMent"
     echo
-    echo "1) GRE"
-    echo "2) Forwarder"
+    echo "1) GRE Tunnels"
+    echo "2) Socat Forwarders"
     echo "0) Back"
     echo
     read -r -e -p "Select: " sel
@@ -579,11 +801,12 @@ services_management() {
         ;;
 
       2)
-        mapfile -t FW_UNITS < <(get_all_fw_units)
+        local -a SOCAT_UNITS
+        mapfile -t SOCAT_UNITS < <(find /etc/systemd/system -maxdepth 1 -type f -name "fw-gre*-*.service" 2>/dev/null | awk -F/ '{print $NF}' | sort -V)
         local -a FW_LABELS=()
         local u gid port
 
-        for u in "${FW_UNITS[@]}"; do
+        for u in "${SOCAT_UNITS[@]}"; do
           if [[ "$u" =~ ^fw-gre([0-9]+)-([0-9]+)\.service$ ]]; then
             gid="${BASH_REMATCH[1]}"
             port="${BASH_REMATCH[2]}"
@@ -593,10 +816,10 @@ services_management() {
           fi
         done
 
-        if menu_select_index "Forwarder Services" "Select Forwarder:" "${FW_LABELS[@]}"; then
+        if menu_select_index "Socat Forwarders" "Select Socat Forwarder:" "${FW_LABELS[@]}"; then
           local fidx="$MENU_SELECTED"
-          u="${FW_UNITS[$fidx]}"
-          add_log "Forwarder selected: ${FW_LABELS[$fidx]}"
+          u="${SOCAT_UNITS[$fidx]}"
+          add_log "Socat Forwarder selected: ${FW_LABELS[$fidx]}"
           service_action_menu "$u"
         fi
         ;;
@@ -627,7 +850,7 @@ uninstall_clean() {
     echo "Target: GRE${id}"
     echo "This will remove:"
     echo "  - gre${id}.service"
-    echo "  - fw-gre${id}-*.service"
+    echo "  - All associated Socat & HAProxy forwarders"
     echo
     echo "Type: YES (confirm)  or  NO (cancel)"
     echo
@@ -644,25 +867,35 @@ uninstall_clean() {
     fi
     add_log "Please type YES or NO."
   done
+
   add_log "Stopping gre${id}.service"
   systemctl stop "gre${id}.service" >/dev/null 2>&1 || true
-  add_log "Disabling gre${id}.service"
   systemctl disable "gre${id}.service" >/dev/null 2>&1 || true
-  mapfile -t FW_UNITS < <(get_fw_units_for_id "$id")
-  if ((${#FW_UNITS[@]} > 0)); then
-    local u
-    for u in "${FW_UNITS[@]}"; do
-      add_log "Stopping $u"
-      systemctl stop "$u" >/dev/null 2>&1 || true
-      add_log "Disabling $u"
-      systemctl disable "$u" >/dev/null 2>&1 || true
+
+  # Socat
+  local -a socat_fw
+  mapfile -t socat_fw < <(find /etc/systemd/system -maxdepth 1 -type f -name "fw-gre${id}-*.service" 2>/dev/null | awk -F/ '{print $NF}')
+  for u in "${socat_fw[@]}"; do
+    add_log "Stopping $u"
+    systemctl stop "$u" >/dev/null 2>&1 || true
+    systemctl disable "$u" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/$u"
+  done
+
+  # HAProxy
+  local -a ha_fw
+  mapfile -t ha_fw < <(find /etc/haproxy/gre-forwards -maxdepth 1 -type f -name "fw-ha-gre${id}-*.cfg" 2>/dev/null)
+  if ((${#ha_fw[@]} > 0)); then
+    for f in "${ha_fw[@]}"; do
+      add_log "Removing HAProxy snippet: $(basename "$f")"
+      rm -f "$f"
     done
-  else
-    add_log "No forwarders found for GRE${id}"
+    update_haproxy_config
   fi
-  add_log "Removing unit files..."
+
+  add_log "Removing GRE unit file..."
   rm -f "/etc/systemd/system/gre${id}.service" >/dev/null 2>&1 || true
-  rm -f /etc/systemd/system/fw-gre${id}-*.service >/dev/null 2>&1 || true
+  
   add_log "Reloading systemd..."
   systemctl daemon-reload >/dev/null 2>&1 || true
   systemctl reset-failed  >/dev/null 2>&1 || true
@@ -671,6 +904,7 @@ uninstall_clean() {
   render
   pause_enter
 }
+
 main_menu() {
   local choice=""
   while true; do
@@ -678,7 +912,10 @@ main_menu() {
     echo "1 > IRAN SETUP"
     echo "2 > KHAREJ SETUP"
     echo "3 > Services ManageMent"
-    echo "4 > Unistall & Clean"
+    echo "4 > HAProxy ManageMent"
+    echo "5 > Unistall & Clean"
+    echo "6 > Install HAProxy"
+    echo "7 > Uninstall HAProxy"
     echo "0 > Exit"
     echo
     read -r -e -p "Select option: " choice
@@ -688,7 +925,10 @@ main_menu() {
       1) add_log "Selected: IRAN SETUP"; iran_setup ;;
       2) add_log "Selected: KHAREJ SETUP"; kharej_setup ;;
       3) add_log "Selected: Services ManageMent"; services_management ;;
-      4) add_log "Selected: Unistall & Clean"; uninstall_clean ;;
+      4) add_log "Selected: HAProxy ManageMent"; haproxy_management ;;
+      5) add_log "Selected: Unistall & Clean"; uninstall_clean ;;
+      6) add_log "Selected: Install HAProxy"; install_haproxy ;;
+      7) add_log "Selected: Uninstall HAProxy"; uninstall_haproxy ;;
       0) add_log "Bye!"; render; exit 0 ;;
       *) add_log "Invalid option: $choice" ;;
     esac
