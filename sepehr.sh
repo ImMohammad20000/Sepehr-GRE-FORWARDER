@@ -257,11 +257,6 @@ unit_exists() { [[ -f "/etc/systemd/system/$1" ]]; }
 
 enable_now() { systemctl enable --now "$1" >/dev/null 2>&1; }
 
-stop_disable() {
-  systemctl stop "$1" >/dev/null 2>&1
-  systemctl disable "$1" >/dev/null 2>&1
-}
-
 show_unit_status_brief() {
   systemctl --no-pager --full status "$1" 2>&1 | sed -n '1,12p'
 }
@@ -534,21 +529,6 @@ get_gre_ids() {
   done < <(find /etc/systemd/system -maxdepth 1 -type f -name 'gre*.service' 2>/dev/null || true)
 
   printf "%s\n" "${ids[@]}" | awk 'NF{a[$0]=1} END{for(k in a) print k}' | sort -n
-}
-
-get_fw_units_for_id() {
-  local id="$1"
-  find /etc/systemd/system -maxdepth 1 -type f \( -name "fw-gre${id}-*.service" -o -name "fw-ha-gre${id}-*.service" \) 2>/dev/null \
-    | awk -F/ '{print $NF}' \
-    | grep -E "^(fw-gre${id}|fw-ha-gre${id})-[0-9]+\.service$" \
-    | sort -V || true
-}
-
-get_all_fw_units() {
-  find /etc/systemd/system -maxdepth 1 -type f \( -name "fw-gre*-*.service" -o -name "fw-ha-gre*-*.service" \) 2>/dev/null \
-    | awk -F/ '{print $NF}' \
-    | grep -E '^(fw-gre|fw-ha-gre)[0-9]+-[0-9]+\.service$' \
-    | sort -V || true
 }
 MENU_SELECTED=-1
 
