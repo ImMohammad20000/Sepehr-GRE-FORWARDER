@@ -783,9 +783,8 @@ haproxy_management() {
     echo "HAProxy ManageMent"
     echo
     echo "1) Add Port Forward(s)"
-    echo "2) Manage Existing Forwards (Snippets)"
-    echo "3) HAProxy Service Control (haproxy-gre.service)"
-    echo "4) View Full Config (/etc/haproxy/haproxy-gre.cfg)"
+    echo "2) HAProxy Service Control (haproxy-gre.service)"
+    echo "3) View Full Config (/etc/haproxy/haproxy-gre.cfg)"
     echo "0) Back"
     echo
     read -r -e -p "Select: " sel
@@ -793,34 +792,8 @@ haproxy_management() {
 
     case "$sel" in
       1) add_port_forward_menu "haproxy" ;;
-      2)
-        local -a ha_configs
-        local -a ha_labels
-        mapfile -t ha_configs < <(find /etc/haproxy/gre-forwards -maxdepth 1 -type f -name "fw-ha-gre*-*.cfg" 2>/dev/null | awk -F/ '{print $NF}' | sort -V)
-        
-        if ((${#ha_configs[@]} == 0)); then
-          add_log "No HAProxy forwards found."
-          render
-          pause_enter
-          continue
-        fi
-
-        for cfg in "${ha_configs[@]}"; do
-          if [[ "$cfg" =~ ^fw-ha-gre([0-9]+)-([0-9]+)\.cfg$ ]]; then
-            ha_labels+=("GRE${BASH_REMATCH[1]}:${BASH_REMATCH[2]}")
-          else
-            ha_labels+=("$cfg")
-          fi
-        done
-
-        if menu_select_index "HAProxy Forwards" "Select HAProxy forward to manage:" "${ha_labels[@]}"; then
-          local idx="$MENU_SELECTED"
-          local target="${ha_configs[$idx]}"
-          service_action_menu "$target"
-        fi
-        ;;
-      3) service_action_menu "haproxy-gre.service" ;;
-      4)
+      2) service_action_menu "haproxy-gre.service" ;;
+      3)
         render
         echo "---- HAProxy GRE Config ----"
         if [[ -f /etc/haproxy/haproxy-gre.cfg ]]; then
