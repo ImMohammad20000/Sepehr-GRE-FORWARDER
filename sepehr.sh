@@ -516,6 +516,15 @@ kharej_setup() {
   show_unit_status_brief "gre${ID}.service"
   pause_enter
 }
+
+get_gre_ip_from_unit() {
+  local id="$1"
+  local path="/etc/systemd/system/gre${id}.service"
+  if [[ -f "$path" ]]; then
+     grep "ip addr add" "$path" | sed -E 's/.*ip addr add ([0-9.]+).*/\1/'
+  fi
+}
+
 get_gre_ids() {
   local ids=()
 
@@ -530,6 +539,7 @@ get_gre_ids() {
 
   printf "%s\n" "${ids[@]}" | awk 'NF{a[$0]=1} END{for(k in a) print k}' | sort -n
 }
+
 MENU_SELECTED=-1
 
 menu_select_index() {
@@ -767,9 +777,14 @@ services_management() {
       1)
         mapfile -t GRE_IDS < <(get_gre_ids)
         local -a GRE_LABELS=()
-        local id
+        local id ip
         for id in "${GRE_IDS[@]}"; do
-          GRE_LABELS+=("GRE${id}")
+          ip="$(get_gre_ip_from_unit "$id")"
+          if [[ -n "$ip" ]]; then
+            GRE_LABELS+=("GRE${id} [${ip}]")
+          else
+            GRE_LABELS+=("GRE${id}")
+          fi
         done
 
         if menu_select_index "GRE Services" "Select GRE:" "${GRE_LABELS[@]}"; then
