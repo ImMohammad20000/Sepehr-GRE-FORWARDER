@@ -585,6 +585,61 @@ menu_select_index() {
     add_log "Invalid selection: $choice"
   done
 }
+
+add_port_forward_menu() {
+  local method="$1" # "socat" or "haproxy"
+  mapfile -t GRE_IDS < <(get_gre_ids)
+  if ((${#GRE_IDS[@]} == 0)); then
+    add_log "No GRE tunnels found."
+    render
+    pause_enter
+    return 0
+  fi
+
+  local -a GRE_LABELS=()
+  local id ip
+  for id in "${GRE_IDS[@]}"; do
+    ip="$(get_gre_ip_from_unit "$id")"
+    GRE_LABELS+=("GRE${id} [${ip%.*}.0/24]")
+  done
+
+  if ! menu_select_index "Add Port Forward to GRE (${method^^})" "Select GRE Tunnel:" "${GRE_LABELS[@]}"; then
+    return 0
+  fi
+
+  local idx="$MENU_SELECTED"
+  local id="${GRE_IDS[$idx]}"
+  local local_ip="$(get_gre_ip_from_unit "$id")"
+  local peer_ip=""
+
+  if [[ "$local_ip" =~ \.1$ ]]; then
+    peer_ip="${local_ip%.*}.2"
+  elif [[ "$local_ip" =~ \.2$ ]]; then
+    peer_ip="${local_ip%.*}.1"
+  else
+    add_log "Could not determine peer IP for GRE${id} ($local_ip)"
+    render
+    pause_enter
+    return 0
+  fi
+
+  ask_ports # Sets PORT_LIST
+
+  add_log "Adding ports to GRE${id} using ${method^^}..."
+  local p
+  for p in "${PORT_LIST[@]}"; do
+    if [[ "$method" == "socat" ]]; then
+      make_fw_service "$id" "$p" "$peer_ip"
+      enable_now "fw-gre${id}-${p}.service"
+    else
+      make_haproxy_fw_service "$id" "$p" "$peer_ip"
+    fi
+  done
+  systemd_reload
+  add_log "Ports added successfully."
+  pause_enter
+}
+
 service_action_menu() {
   local unit="$1"
   local action=""
@@ -706,16 +761,17 @@ haproxy_management() {
     render
     echo "HAProxy ManageMent"
     echo
-    echo "1) HAProxy Service Control (haproxy-gre.service)"
-    echo "2) Manage Forwards (Snippets)"
-    echo "3) View Full Config (/etc/haproxy/haproxy-gre.cfg)"
+    echo "1) Add Port Forward(s)"
+    echo "2) Manage Existing Forwards (Snippets)"
+    echo "3) HAProxy Service Control (haproxy-gre.service)"
+    echo "4) View Full Config (/etc/haproxy/haproxy-gre.cfg)"
     echo "0) Back"
     echo
     read -r -e -p "Select: " sel
     sel="$(trim "$sel")"
 
     case "$sel" in
-      1) service_action_menu "haproxy-gre.service" ;;
+      1) add_port_forward_menu "haproxy" ;;
       2)
         local -a ha_configs
         local -a ha_labels
@@ -742,7 +798,8 @@ haproxy_management() {
           service_action_menu "$target"
         fi
         ;;
-      3)
+      3) service_action_menu "haproxy-gre.service" ;;
+      4)
         render
         echo "---- HAProxy GRE Config ----"
         if [[ -f /etc/haproxy/haproxy-gre.cfg ]]; then
@@ -759,42 +816,21 @@ haproxy_management() {
   done
 }
 
-services_management() {
+socat_management() {
   local sel=""
-
   while true; do
     render
-    echo "Services ManageMent"
+    echo "Socat ManageMent"
     echo
-    echo "1) GRE Tunnels"
-    echo "2) Socat Forwarders"
+    echo "1) Add Port Forward(s)"
+    echo "2) Manage Existing Forwards"
     echo "0) Back"
     echo
     read -r -e -p "Select: " sel
     sel="$(trim "$sel")"
 
     case "$sel" in
-      1)
-        mapfile -t GRE_IDS < <(get_gre_ids)
-        local -a GRE_LABELS=()
-        local id ip
-        for id in "${GRE_IDS[@]}"; do
-          ip="$(get_gre_ip_from_unit "$id")"
-          if [[ -n "$ip" ]]; then
-            GRE_LABELS+=("GRE${id} [${ip}]")
-          else
-            GRE_LABELS+=("GRE${id}")
-          fi
-        done
-
-        if menu_select_index "GRE Services" "Select GRE:" "${GRE_LABELS[@]}"; then
-          local idx="$MENU_SELECTED"
-          id="${GRE_IDS[$idx]}"
-          add_log "GRE selected: GRE${id}"
-          service_action_menu "gre${id}.service"
-        fi
-        ;;
-
+      1) add_port_forward_menu "socat" ;;
       2)
         local -a SOCAT_UNITS
         mapfile -t SOCAT_UNITS < <(find /etc/systemd/system -maxdepth 1 -type f -name "fw-gre*-*.service" 2>/dev/null | awk -F/ '{print $NF}' | sort -V)
@@ -818,12 +854,33 @@ services_management() {
           service_action_menu "$u"
         fi
         ;;
-
       0) return 0 ;;
       *) add_log "Invalid selection: $sel" ;;
     esac
   done
 }
+
+gre_management() {
+  mapfile -t GRE_IDS < <(get_gre_ids)
+  local -a GRE_LABELS=()
+  local id ip
+  for id in "${GRE_IDS[@]}"; do
+    ip="$(get_gre_ip_from_unit "$id")"
+    if [[ -n "$ip" ]]; then
+      GRE_LABELS+=("GRE${id} [${ip%.*}.0/24]")
+    else
+      GRE_LABELS+=("GRE${id}")
+    fi
+  done
+
+  if menu_select_index "GRE Services" "Select GRE Tunnel to manage:" "${GRE_LABELS[@]}"; then
+    local idx="$MENU_SELECTED"
+    id="${GRE_IDS[$idx]}"
+    add_log "GRE selected: GRE${id}"
+    service_action_menu "gre${id}.service"
+  fi
+}
+
 uninstall_clean() {
   mapfile -t GRE_IDS < <(get_gre_ids)
   local -a GRE_LABELS=()
@@ -906,11 +963,12 @@ main_menu() {
     render
     echo "1 > IRAN SETUP"
     echo "2 > KHAREJ SETUP"
-    echo "3 > Services ManageMent"
-    echo "4 > HAProxy ManageMent"
-    echo "5 > Unistall & Clean"
-    echo "6 > Install HAProxy"
-    echo "7 > Uninstall HAProxy"
+    echo "3 > GRE Tunnels ManageMent"
+    echo "4 > Socat ManageMent"
+    echo "5 > HAProxy ManageMent"
+    echo "6 > Unistall & Clean"
+    echo "7 > Install HAProxy"
+    echo "8 > Uninstall HAProxy"
     echo "0 > Exit"
     echo
     read -r -e -p "Select option: " choice
@@ -919,16 +977,18 @@ main_menu() {
     case "$choice" in
       1) add_log "Selected: IRAN SETUP"; iran_setup ;;
       2) add_log "Selected: KHAREJ SETUP"; kharej_setup ;;
-      3) add_log "Selected: Services ManageMent"; services_management ;;
-      4) add_log "Selected: HAProxy ManageMent"; haproxy_management ;;
-      5) add_log "Selected: Unistall & Clean"; uninstall_clean ;;
-      6) add_log "Selected: Install HAProxy"; install_haproxy ;;
-      7) add_log "Selected: Uninstall HAProxy"; uninstall_haproxy ;;
+      3) add_log "Selected: GRE ManageMent"; gre_management ;;
+      4) add_log "Selected: Socat ManageMent"; socat_management ;;
+      5) add_log "Selected: HAProxy ManageMent"; haproxy_management ;;
+      6) add_log "Selected: Unistall & Clean"; uninstall_clean ;;
+      7) add_log "Selected: Install HAProxy"; install_haproxy ;;
+      8) add_log "Selected: Uninstall HAProxy"; uninstall_haproxy ;;
       0) add_log "Bye!"; render; exit 0 ;;
       *) add_log "Invalid option: $choice" ;;
     esac
   done
 }
+
 ensure_root "$@"
 add_log "SEPEHR GRE+FORWARDER installer."
 main_menu
