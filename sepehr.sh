@@ -393,8 +393,6 @@ frontend ft_gre${id}_${port}
 backend bk_gre${id}_${port}
     server srv1 ${target_ip}:${port} maxconn 10000
 EOF
-
-  update_haproxy_config
 }
 
 iran_setup() {
@@ -460,6 +458,7 @@ iran_setup() {
   done
 
   if [[ "$METHOD" == "2" ]]; then
+     update_haproxy_config
      enable_now "haproxy-gre.service"
   fi
 
@@ -600,7 +599,11 @@ add_port_forward_menu() {
   local id ip
   for id in "${GRE_IDS[@]}"; do
     ip="$(get_gre_ip_from_unit "$id")"
-    GRE_LABELS+=("GRE${id} [${ip%.*}.0/24]")
+    if [[ -n "$ip" ]]; then
+      GRE_LABELS+=("GRE${id} [${ip%.*}.0/24]")
+    else
+      GRE_LABELS+=("GRE${id} [IP Unknown]")
+    fi
   done
 
   if ! menu_select_index "Add Port Forward to GRE (${method^^})" "Select GRE Tunnel:" "${GRE_LABELS[@]}"; then
@@ -611,6 +614,13 @@ add_port_forward_menu() {
   local id="${GRE_IDS[$idx]}"
   local local_ip="$(get_gre_ip_from_unit "$id")"
   local peer_ip=""
+
+  if [[ -z "$local_ip" ]]; then
+    add_log "Error: Could not find GRE IP in gre${id}.service"
+    render
+    pause_enter
+    return 0
+  fi
 
   if [[ "$local_ip" =~ \.1$ ]]; then
     peer_ip="${local_ip%.*}.2"
@@ -623,20 +633,31 @@ add_port_forward_menu() {
     return 0
   fi
 
+  add_log "Using Peer IP: $peer_ip"
   ask_ports # Sets PORT_LIST
 
-  add_log "Adding ports to GRE${id} using ${method^^}..."
+  add_log "Creating ${method^^} forwarders for ports: ${PORT_LIST[*]}"
   local p
   for p in "${PORT_LIST[@]}"; do
     if [[ "$method" == "socat" ]]; then
       make_fw_service "$id" "$p" "$peer_ip"
-      enable_now "fw-gre${id}-${p}.service"
     else
       make_haproxy_fw_service "$id" "$p" "$peer_ip"
     fi
   done
-  systemd_reload
-  add_log "Ports added successfully."
+
+  if [[ "$method" == "socat" ]]; then
+    add_log "Reloading systemd and starting Socat services..."
+    systemd_reload
+    for p in "${PORT_LIST[@]}"; do
+      enable_now "fw-gre${id}-${p}.service"
+    done
+  else
+    add_log "Regenerating HAProxy configuration and reloading..."
+    update_haproxy_config
+  fi
+
+  add_log "Process completed for GRE${id}"
   pause_enter
 }
 
