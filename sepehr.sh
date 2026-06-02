@@ -474,6 +474,7 @@ service_action_menu() {
     echo "2) Restart"
     echo "3) Stop & Disable"
     echo "4) Status"
+    echo "5) Remove (Permanently)"
     echo "0) Back"
     echo
 
@@ -501,6 +502,44 @@ service_action_menu() {
         systemctl --no-pager --full status "$unit" 2>&1 | sed -n '1,16p'
         echo "------------------------"
         pause_enter
+        ;;
+      5)
+        render
+        echo "Remove service: $unit"
+        echo
+        if [[ "$unit" =~ ^gre([0-9]+)\.service$ ]]; then
+          echo "WARNING: This is a GRE tunnel. Removing it will also remove all associated forwarders."
+        fi
+        echo "Type YES to confirm deletion:"
+        local confirm=""
+        read -r -e -p "Confirm: " confirm
+        confirm="$(trim "$confirm")"
+        if [[ "$confirm" == "YES" ]]; then
+           add_log "Removing $unit"
+           systemctl stop "$unit" >/dev/null 2>&1 || true
+           systemctl disable "$unit" >/dev/null 2>&1 || true
+
+           if [[ "$unit" =~ ^gre([0-9]+)\.service$ ]]; then
+             local id="${BASH_REMATCH[1]}"
+             local -a fw_to_del
+             mapfile -t fw_to_del < <(get_fw_units_for_id "$id")
+             for fwd in "${fw_to_del[@]}"; do
+                add_log "Stopping/Disabling $fwd"
+                systemctl stop "$fwd" >/dev/null 2>&1 || true
+                systemctl disable "$fwd" >/dev/null 2>&1 || true
+                rm -f "/etc/systemd/system/$fwd"
+             done
+           fi
+
+           rm -f "/etc/systemd/system/$unit"
+           systemctl daemon-reload >/dev/null 2>&1
+           systemctl reset-failed >/dev/null 2>&1
+           add_log "Successfully removed: $unit"
+           pause_enter
+           return 0
+        else
+           add_log "Removal cancelled."
+        fi
         ;;
       0) return 0 ;;
       *) add_log "Invalid action: $action" ;;
