@@ -330,11 +330,12 @@ EOF
 update_haproxy_config() {
   local cfg_dir="/etc/haproxy/gre-forwards"
   local main_cfg="/etc/haproxy/haproxy-gre.cfg"
+  local tmp_cfg="${main_cfg}.tmp.$$"
   mkdir -p "$cfg_dir"
 
   add_log "Regenerating HAProxy config..."
 
-  cat >"$main_cfg" <<EOF
+  cat >"$tmp_cfg" <<EOF
 global
     maxconn 10000
 
@@ -347,8 +348,24 @@ EOF
 
   local f
   for f in "$cfg_dir"/*.cfg; do
-    [[ -e "$f" ]] && cat "$f" >> "$main_cfg"
+    [[ -e "$f" ]] && cat "$f" >> "$tmp_cfg"
   done
+
+  if command -v haproxy >/dev/null 2>&1; then
+    if ! haproxy -c -q -f "$tmp_cfg" >/dev/null 2>&1; then
+      add_log "HAProxy config validation failed. Keeping old config."
+      rm -f "$tmp_cfg"
+      return 1
+    fi
+  else
+    add_log "HAProxy binary not found. Config written but service not applied."
+  fi
+
+  if ! mv "$tmp_cfg" "$main_cfg"; then
+    add_log "Failed writing HAProxy config: $main_cfg"
+    rm -f "$tmp_cfg"
+    return 1
+  fi
 
   if ! unit_exists "haproxy-gre.service"; then
     cat >"/etc/systemd/system/haproxy-gre.service" <<EOF
@@ -368,15 +385,23 @@ RestartSec=2
 WantedBy=multi-user.target
 EOF
     systemd_reload
-    enable_now "haproxy-gre.service"
+    enable_now "haproxy-gre.service" && add_log "HAProxy service enabled and started." || { add_log "Failed to enable/start haproxy-gre.service"; return 1; }
   else
-    systemctl reload "haproxy-gre.service" >/dev/null 2>&1 || systemctl restart "haproxy-gre.service" >/dev/null 2>&1
+    systemctl restart "haproxy-gre.service" >/dev/null 2>&1 && add_log "HAProxy service restarted." || { add_log "Failed to restart haproxy-gre.service"; return 1; }
   fi
+
+  return 0
 }
 
 make_haproxy_fw_service() {
   local id="$1" port="$2" target_ip="$3"
-  local snippet_path="/etc/haproxy/gre-forwards/fw-ha-gre${id}-${port}.cfg"
+  local cfg_dir="/etc/haproxy/gre-forwards"
+  local snippet_path="${cfg_dir}/fw-ha-gre${id}-${port}.cfg"
+
+  if ! mkdir -p "$cfg_dir"; then
+    add_log "Failed creating HAProxy snippet directory: $cfg_dir"
+    return 1
+  fi
 
   if [[ -f "$snippet_path" ]]; then
     add_log "HAProxy Forwarder already in config: GRE${id}:${port}"
@@ -393,6 +418,8 @@ frontend ft_gre${id}_${port}
 backend bk_gre${id}_${port}
     server srv1 ${target_ip}:${port} maxconn 10000
 EOF
+
+  [[ $? -eq 0 ]] && add_log "HAProxy snippet created: GRE${id}:${port}" || { add_log "Failed writing HAProxy snippet: GRE${id}:${port}"; return 1; }
 }
 
 iran_setup() {
@@ -429,7 +456,11 @@ iran_setup() {
   peer_gre_ip="$(ipv4_set_last_octet "$GREBASE" 2)"
   add_log "KEY=${key} | IRAN=${local_gre_ip} | KHAREJ=${peer_gre_ip}"
 
-  ensure_packages || { die_soft "Package installation failed."; return 0; }
+  if [[ "$METHOD" == "1" ]]; then
+    ensure_packages || { die_soft "Package installation failed."; return 0; }
+  else
+    ensure_iproute_only || { die_soft "Package installation failed (iproute2)."; return 0; }
+  fi
 
   make_gre_service "$ID" "$IRANIP" "$KHAREJIP" "$local_gre_ip" "$key"
   local rc=$?
@@ -437,14 +468,20 @@ iran_setup() {
   [[ $rc -ne 0 ]] && { die_soft "Failed creating GRE service."; return 0; }
 
   add_log "Creating forwarders..."
+  local failed=0
   local p
   for p in "${PORT_LIST[@]}"; do
     if [[ "$METHOD" == "1" ]]; then
       make_fw_service "$ID" "$p" "$peer_gre_ip"
     else
-      make_haproxy_fw_service "$ID" "$p" "$peer_gre_ip"
+      make_haproxy_fw_service "$ID" "$p" "$peer_gre_ip" || failed=1
     fi
   done
+
+  if ((failed)); then
+    die_soft "Failed creating one or more HAProxy forwarders."
+    return 0
+  fi
 
   add_log "Reloading systemd..."
   systemd_reload
@@ -458,8 +495,7 @@ iran_setup() {
   done
 
   if [[ "$METHOD" == "2" ]]; then
-     update_haproxy_config
-     enable_now "haproxy-gre.service"
+     update_haproxy_config || { die_soft "Failed applying HAProxy configuration."; return 0; }
   fi
 
   render
@@ -587,6 +623,13 @@ menu_select_index() {
 
 add_port_forward_menu() {
   local method="$1" # "socat" or "haproxy"
+  if [[ "$method" == "haproxy" ]] && ! command -v haproxy >/dev/null 2>&1; then
+    add_log "HAProxy is not installed."
+    render
+    pause_enter
+    return 0
+  fi
+
   mapfile -t GRE_IDS < <(get_gre_ids)
   if ((${#GRE_IDS[@]} == 0)); then
     add_log "No GRE tunnels found."
@@ -637,14 +680,20 @@ add_port_forward_menu() {
   ask_ports # Sets PORT_LIST
 
   add_log "Creating ${method^^} forwarders for ports: ${PORT_LIST[*]}"
+  local failed=0
   local p
   for p in "${PORT_LIST[@]}"; do
     if [[ "$method" == "socat" ]]; then
       make_fw_service "$id" "$p" "$peer_ip"
     else
-      make_haproxy_fw_service "$id" "$p" "$peer_ip"
+      make_haproxy_fw_service "$id" "$p" "$peer_ip" || failed=1
     fi
   done
+
+  if ((failed)); then
+    die_soft "Failed creating one or more HAProxy forwarders."
+    return 0
+  fi
 
   if [[ "$method" == "socat" ]]; then
     add_log "Reloading systemd and starting Socat services..."
@@ -653,8 +702,8 @@ add_port_forward_menu() {
       enable_now "fw-gre${id}-${p}.service"
     done
   else
-    add_log "Regenerating HAProxy configuration and reloading..."
-    update_haproxy_config
+    add_log "Regenerating HAProxy configuration and restarting..."
+    update_haproxy_config || { die_soft "Failed applying HAProxy configuration."; return 0; }
   fi
 
   add_log "Process completed for GRE${id}"
