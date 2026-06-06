@@ -40,6 +40,3 @@ ls -la /etc/systemd/system | grep -E 'gre[0-9]+\.service|fw-gre'
 # و برای تنظیمات HAProxy
 ls -la /etc/haproxy/gre-forwards/
 ```
-
-## حمایت
-جهت حمایت فقط برای آرامش روح پاک سپهر عزیز و تمامی عزیزان جان فدای انقلاب دی 1404 ایران عزیزمان دعایی کنید
